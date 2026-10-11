@@ -1,0 +1,129 @@
+# MySQL vs MongoDB access control lab. Local use only: no TLS for MongoDB,
+# no host ports, passwords for admin accounts come from .env (./lab.sh init).
+#
+# mongo:8.0.4 is pinned on purpose: later 8.0 images (e.g. 8.0.32) refuse to
+# start on Linux kernels >= 6.19 (SERVER-121912), which includes OrbStack.
+# GLIBC_TUNABLES silences the tcmalloc rseq startup warning, as the official
+# 8.0 systemd unit does.
+
+name: authlab
+
+x-mongo: &mongo
+  image: mongo:8.0.4
+  entrypoint: ["bash", "/lab/scripts/mongo-start.sh"]
+  stop_grace_period: 20s
+  healthcheck:
+    test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+    interval: 2s
+    retries: 60
+
+services:
+  mysql:
+    image: mysql:8.4
+    container_name: authlab-mysql
+    hostname: mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?run ./lab.sh init first}
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "--silent"]
+      interval: 2s
+      retries: 60
+    volumes:
+      - mysql-data:/var/lib/mysql
+    networks:
+      authlab: { ipv4_address: 172.30.0.5 }
+
+  # Replica set rs0, keyfile internal auth. The auth mode of each member is read
+  # from runtime/state/<node>.mode at start (none | transition | keyfile).
+  mongo1:
+    <<: *mongo
+    container_name: authlab-mongo1
+    hostname: mongo1
+    command: ["--replSet", "rs0"]
+    environment: { NODE: mongo1, GLIBC_TUNABLES: glibc.pthread.rseq=0 }
+    volumes: ["./scripts:/lab/scripts:ro", "./runtime:/lab/runtime:ro", "mongo1-data:/data/db"]
+    networks:
+      authlab: { ipv4_address: 172.30.0.11 }
+  mongo2:
+    <<: *mongo
+    container_name: authlab-mongo2
+    hostname: mongo2
+    command: ["--replSet", "rs0"]
+    environment: { NODE: mongo2, GLIBC_TUNABLES: glibc.pthread.rseq=0 }
+    volumes: ["./scripts:/lab/scripts:ro", "./runtime:/lab/runtime:ro", "mongo2-data:/data/db"]
+    networks:
+      authlab: { ipv4_address: 172.30.0.12 }
+  mongo3:
+    <<: *mongo
+    container_name: authlab-mongo3
+    hostname: mongo3
+    command: ["--replSet", "rs0"]
+    environment: { NODE: mongo3, GLIBC_TUNABLES: glibc.pthread.rseq=0 }
+    volumes: ["./scripts:/lab/scripts:ro", "./runtime:/lab/runtime:ro", "mongo3-data:/data/db"]
+    networks:
+      authlab: { ipv4_address: 172.30.0.13 }
+
+  # Two clients with fixed IPs, for host- and IP-based login restrictions.
+  # Each has mongosh and the mysql client.
+  client-a:
+    build: ./client
+    image: authlab-client
+    container_name: authlab-client-a
+    hostname: client-a
+    volumes: ["./scripts:/lab/scripts:ro"]
+    networks:
+      authlab: { ipv4_address: 172.30.0.21 }
+  client-b:
+    image: authlab-client
+    container_name: authlab-client-b
+    hostname: client-b
+    volumes: ["./scripts:/lab/scripts:ro"]
+    depends_on: [client-a]
+    networks:
+      authlab: { ipv4_address: 172.30.0.22 }
+
+  # Optional sharded cluster: docker compose --profile sharded up -d
+  cfg:
+    <<: *mongo
+    profiles: ["sharded"]
+    container_name: authlab-cfg
+    hostname: cfg
+    command: ["--configsvr", "--replSet", "cfg"]
+    environment: { NODE: cfg, GLIBC_TUNABLES: glibc.pthread.rseq=0 }
+    volumes: ["./scripts:/lab/scripts:ro", "./runtime:/lab/runtime:ro", "cfg-data:/data/db"]
+    networks:
+      authlab: { ipv4_address: 172.30.0.31 }
+  shard1:
+    <<: *mongo
+    profiles: ["sharded"]
+    container_name: authlab-shard1
+    hostname: shard1
+    command: ["--shardsvr", "--replSet", "sh1"]
+    environment: { NODE: shard1, GLIBC_TUNABLES: glibc.pthread.rseq=0 }
+    volumes: ["./scripts:/lab/scripts:ro", "./runtime:/lab/runtime:ro", "shard1-data:/data/db"]
+    networks:
+      authlab: { ipv4_address: 172.30.0.32 }
+  mongos:
+    <<: *mongo
+    profiles: ["sharded"]
+    container_name: authlab-mongos
+    hostname: mongos
+    command: ["--configdb", "cfg/cfg:27017"]
+    environment: { NODE: mongos, ROLE: mongos, GLIBC_TUNABLES: glibc.pthread.rseq=0 }
+    volumes: ["./scripts:/lab/scripts:ro", "./runtime:/lab/runtime:ro"]
+    networks:
+      authlab: { ipv4_address: 172.30.0.33 }
+
+networks:
+  authlab:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+
+volumes:
+  mysql-data:
+  mongo1-data:
+  mongo2-data:
+  mongo3-data:
+  cfg-data:
+  shard1-data:
